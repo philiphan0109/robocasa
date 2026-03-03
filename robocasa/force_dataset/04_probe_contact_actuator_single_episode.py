@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Visualization-only force dashboard generator for a single LeRobot episode.
+Contact + actuator probe dashboard for a single LeRobot episode.
 
-This script does NOT edit or copy datasets. It runs action replay and writes:
+This script does NOT modify datasets. It runs action replay and writes:
 1) an MP4 dashboard video, and
 2) a summary JSON artifact.
 """
@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import imageio.v2 as imageio
+import mujoco
 import numpy as np
 
 try:
@@ -102,28 +103,62 @@ def select_arm_dofs(model, include_gripper=False):
     return selected_joint_names, selected_dof_indices
 
 
-def select_robot_bodies(model):
+def select_robot_geoms(model):
     prefixes = ("robot0_", "gripper0_", "mobilebase0_")
-    body_ids = []
-    body_names = []
-    for i in range(model.nbody):
-        name = model.body_id2name(i)
+    geom_ids = []
+    geom_names = []
+    for i in range(model.ngeom):
+        name = model.geom_id2name(i)
         if name is None:
             continue
         if name.startswith(prefixes):
-            body_ids.append(i)
-            body_names.append(name)
-    return body_ids, body_names
+            geom_ids.append(i)
+            geom_names.append(name)
+    return geom_ids, geom_names
+
+
+def sample_contact_metrics(sim, robot_geom_ids_set):
+    d = sim.data
+    ncon = int(d.ncon)
+
+    robot_count = 0
+    robot_normal_sum = 0.0
+    robot_normal_max = 0.0
+    robot_force_l2_sum = 0.0
+
+    all_normal_sum = 0.0
+    all_normal_max = 0.0
+
+    cf = np.zeros((6,), dtype=np.float64)
+    for i in range(ncon):
+        mujoco.mj_contactForce(sim.model._model, sim.data._data, i, cf)
+        normal = abs(float(cf[0]))
+        force_l2 = float(np.linalg.norm(cf[:3]))
+        all_normal_sum += normal
+        all_normal_max = max(all_normal_max, normal)
+
+        c = d.contact[i]
+        g1 = int(c.geom1)
+        g2 = int(c.geom2)
+        robot_other = (g1 in robot_geom_ids_set) ^ (g2 in robot_geom_ids_set)
+        if robot_other:
+            robot_count += 1
+            robot_normal_sum += normal
+            robot_normal_max = max(robot_normal_max, normal)
+            robot_force_l2_sum += force_l2
+
+    return {
+        "contact_total_count": ncon,
+        "contact_robot_count": robot_count,
+        "contact_robot_normal_sum": robot_normal_sum,
+        "contact_robot_normal_max": robot_normal_max,
+        "contact_robot_force_l2_sum": robot_force_l2_sum,
+        "contact_all_normal_sum": all_normal_sum,
+        "contact_all_normal_max": all_normal_max,
+    }
 
 
 def normalize_time_series(arr, mode: str, eps: float):
-    """
-    Normalize time-series data with shape [T, D] or [T] using per-dimension absmax.
-    Modes:
-      - none: no normalization
-      - static_absmax: uses full sequence absmax (non-causal, probe only)
-      - running_absmax: uses absmax up to time t (causal)
-    """
     x = np.asarray(arr, dtype=np.float64)
     squeeze = False
     if x.ndim == 1:
@@ -132,89 +167,20 @@ def normalize_time_series(arr, mode: str, eps: float):
 
     if mode == "none":
         out = x.copy()
-        meta = {
-            "mode": "none",
-            "causal": True,
-            "raw_absmax": float(np.max(np.abs(x))),
-            "final_scale_absmax": None,
-        }
     elif mode == "static_absmax":
         scale = np.max(np.abs(x), axis=0)
         denom = np.maximum(scale, float(eps))
         out = np.clip(x / denom[None, :], -1.0, 1.0)
-        meta = {
-            "mode": "static_absmax",
-            "causal": False,
-            "raw_absmax": float(np.max(np.abs(x))),
-            "final_scale_absmax": float(np.max(scale)),
-        }
     elif mode == "running_absmax":
         running = np.maximum.accumulate(np.abs(x), axis=0)
         denom = np.maximum(running, float(eps))
         out = np.clip(x / denom, -1.0, 1.0)
-        meta = {
-            "mode": "running_absmax",
-            "causal": True,
-            "raw_absmax": float(np.max(np.abs(x))),
-            "final_scale_absmax": float(np.max(running[-1])),
-        }
     else:
         raise ValueError(f"Unknown normalization mode: {mode}")
 
     if squeeze:
         out = out[:, 0]
-    return out, meta
-
-
-def compute_probe_signals(data: dict, normalize_mode: str, norm_eps: float):
-    qfrc = np.asarray(data["qfrc_selected"], dtype=np.float64)  # [T, dof]
-    cfrc_norm = np.asarray(
-        data["cfrc_robot_force_norms"], dtype=np.float64
-    )  # [T, body]
-
-    qfrc_normed, qfrc_norm_meta = normalize_time_series(
-        qfrc, mode=normalize_mode, eps=norm_eps
-    )
-    cfrc_normed, cfrc_norm_meta = normalize_time_series(
-        cfrc_norm, mode=normalize_mode, eps=norm_eps
-    )
-
-    qfrc_mag = np.linalg.norm(qfrc, axis=1)
-    cfrc_max = np.max(cfrc_norm, axis=1)
-    cfrc_mag = np.linalg.norm(cfrc_norm, axis=1)
-
-    qfrc_mag_norm, qfrc_mag_norm_meta = normalize_time_series(
-        qfrc_mag, mode=normalize_mode, eps=norm_eps
-    )
-    cfrc_max_norm, cfrc_max_norm_meta = normalize_time_series(
-        cfrc_max, mode=normalize_mode, eps=norm_eps
-    )
-    cfrc_mag_norm, cfrc_mag_norm_meta = normalize_time_series(
-        cfrc_mag, mode=normalize_mode, eps=norm_eps
-    )
-
-    return {
-        "qfrc_dof_raw": qfrc,
-        "qfrc_dof_normed": qfrc_normed,
-        "cfrc_body_raw": cfrc_norm,
-        "cfrc_body_normed": cfrc_normed,
-        "qfrc_mag_raw": qfrc_mag,
-        "qfrc_mag_normed": qfrc_mag_norm,
-        "cfrc_max_raw": cfrc_max,
-        "cfrc_max_normed": cfrc_max_norm,
-        "cfrc_mag_raw": cfrc_mag,
-        "cfrc_mag_normed": cfrc_mag_norm,
-        "normalization_meta": {
-            "qfrc_dof": qfrc_norm_meta,
-            "cfrc_body": cfrc_norm_meta,
-            "qfrc_mag": qfrc_mag_norm_meta,
-            "cfrc_max": cfrc_max_norm_meta,
-            "cfrc_mag": cfrc_mag_norm_meta,
-            "eps": float(norm_eps),
-            "mode": normalize_mode,
-            "causal": normalize_mode in ("none", "running_absmax"),
-        },
-    }
+    return out
 
 
 def stats_1d(arr):
@@ -263,13 +229,18 @@ def collect_timeseries(
     if len(arm_dof_indices) == 0:
         raise RuntimeError("No arm DoF indices found from robot0_joint1..7 selection.")
 
-    robot_body_ids, robot_body_names = select_robot_bodies(model)
-    if len(robot_body_ids) == 0:
-        raise RuntimeError("No robot bodies found for cfrc selection.")
+    robot_geom_ids, robot_geom_names = select_robot_geoms(model)
+    robot_geom_ids_set = set(robot_geom_ids)
 
-    qfrc_selected = []
-    cfrc_robot_force_norms = []
-    ncon = []
+    qfrc_constraint_selected = []
+    qfrc_actuator_selected = []
+    contact_total_count = []
+    contact_robot_count = []
+    contact_robot_normal_sum = []
+    contact_robot_normal_max = []
+    contact_robot_force_l2_sum = []
+    contact_all_normal_sum = []
+    contact_all_normal_max = []
     divergence = np.full((t_horizon,), np.nan, dtype=np.float64)
     camera_frames = []
 
@@ -278,45 +249,51 @@ def collect_timeseries(
         env.step(actions[t])  # restore-state -> play-action -> record-force
 
         d = env.sim.data
-        qfrc = np.asarray(d.qfrc_constraint, dtype=np.float64)
-        cfrc_ext = np.asarray(d.cfrc_ext, dtype=np.float64)
-        cfrc_trans = cfrc_ext[robot_body_ids, 0:3]
-        cfrc_norm = np.linalg.norm(cfrc_trans, axis=1)
+        qfrc_constraint = np.asarray(d.qfrc_constraint, dtype=np.float64)
+        qfrc_actuator = np.asarray(d.qfrc_actuator, dtype=np.float64)
+        contact = sample_contact_metrics(env.sim, robot_geom_ids_set=robot_geom_ids_set)
 
         frame = env.sim.render(height=height, width=width, camera_name=camera_name)[
             ::-1
         ]
 
-        qfrc_selected.append(qfrc[arm_dof_indices])
-        cfrc_robot_force_norms.append(cfrc_norm)
-        ncon.append(int(d.ncon))
+        qfrc_constraint_selected.append(qfrc_constraint[arm_dof_indices])
+        qfrc_actuator_selected.append(qfrc_actuator[arm_dof_indices])
+        contact_total_count.append(contact["contact_total_count"])
+        contact_robot_count.append(contact["contact_robot_count"])
+        contact_robot_normal_sum.append(contact["contact_robot_normal_sum"])
+        contact_robot_normal_max.append(contact["contact_robot_normal_max"])
+        contact_robot_force_l2_sum.append(contact["contact_robot_force_l2_sum"])
+        contact_all_normal_sum.append(contact["contact_all_normal_sum"])
+        contact_all_normal_max.append(contact["contact_all_normal_max"])
         camera_frames.append(frame)
 
         if t < t_horizon - 1:
             s_next = np.asarray(env.sim.get_state().flatten(), dtype=np.float64)
             divergence[t] = float(np.linalg.norm(s_next - states[t + 1]))
 
-    qfrc_selected = np.stack(qfrc_selected, axis=0)
-    cfrc_robot_force_norms = np.stack(cfrc_robot_force_norms, axis=0)
-    ncon = np.asarray(ncon, dtype=np.int64)
-
-    total_body_norm = np.sum(cfrc_robot_force_norms, axis=0)
-
     return {
         "T": int(t_horizon),
-        "qfrc_selected": qfrc_selected,
-        "cfrc_robot_force_norms": cfrc_robot_force_norms,
-        "ncon": ncon,
-        "divergence": divergence,
         "camera_frames": camera_frames,
+        "divergence": divergence,
         "arm_joint_names": arm_joint_names,
         "arm_dof_indices": arm_dof_indices,
-        "robot_body_ids": robot_body_ids,
-        "robot_body_names": robot_body_names,
-        "total_body_norm": total_body_norm,
-        "nv": int(model.nv),
-        "nbody": int(model.nbody),
-        "dof_joint_ids": np.asarray(model.dof_jntid, dtype=np.int64).tolist(),
+        "robot_geom_names": robot_geom_names,
+        "qfrc_constraint_selected": np.stack(qfrc_constraint_selected, axis=0),
+        "qfrc_actuator_selected": np.stack(qfrc_actuator_selected, axis=0),
+        "contact_total_count": np.asarray(contact_total_count, dtype=np.int64),
+        "contact_robot_count": np.asarray(contact_robot_count, dtype=np.int64),
+        "contact_robot_normal_sum": np.asarray(
+            contact_robot_normal_sum, dtype=np.float64
+        ),
+        "contact_robot_normal_max": np.asarray(
+            contact_robot_normal_max, dtype=np.float64
+        ),
+        "contact_robot_force_l2_sum": np.asarray(
+            contact_robot_force_l2_sum, dtype=np.float64
+        ),
+        "contact_all_normal_sum": np.asarray(contact_all_normal_sum, dtype=np.float64),
+        "contact_all_normal_max": np.asarray(contact_all_normal_max, dtype=np.float64),
     }
 
 
@@ -326,141 +303,161 @@ def make_dashboard_video(
     episode: int,
     fps: int,
     camera_name: str,
-    topk_cfrc: int,
     div_thresh: float,
-    dashboard_mode: str,
     normalize_mode: str,
     norm_eps: float,
 ):
     t_horizon = data["T"]
-    ncon = data["ncon"]
+    x = np.arange(t_horizon)
     divergence = data["divergence"]
     camera_frames = data["camera_frames"]
 
-    robot_body_names = data["robot_body_names"]
-    robot_body_ids = data["robot_body_ids"]
-    signals = compute_probe_signals(
-        data=data, normalize_mode=normalize_mode, norm_eps=norm_eps
+    qfrc_constraint_mag = np.linalg.norm(data["qfrc_constraint_selected"], axis=1)
+    qfrc_actuator_mag = np.linalg.norm(data["qfrc_actuator_selected"], axis=1)
+    qfrc_constraint_mag_n = normalize_time_series(
+        qfrc_constraint_mag, mode=normalize_mode, eps=norm_eps
+    )
+    qfrc_actuator_mag_n = normalize_time_series(
+        qfrc_actuator_mag, mode=normalize_mode, eps=norm_eps
     )
 
-    rank_idx = np.argsort(-data["total_body_norm"])
-    k = max(1, min(int(topk_cfrc), len(rank_idx)))
-    topk_local = rank_idx[:k]
-    topk_body_names = [robot_body_names[i] for i in topk_local]
-    topk_body_ids = [robot_body_ids[i] for i in topk_local]
-
-    x = np.arange(t_horizon)
-    qfrc_for_plot = (
-        signals["qfrc_dof_normed"]
-        if normalize_mode != "none"
-        else signals["qfrc_dof_raw"]
+    robot_contact_normal_sum = data["contact_robot_normal_sum"]
+    robot_contact_normal_max = data["contact_robot_normal_max"]
+    robot_contact_count = data["contact_robot_count"].astype(np.float64)
+    robot_contact_normal_sum_n = normalize_time_series(
+        robot_contact_normal_sum, mode=normalize_mode, eps=norm_eps
     )
-    cfrc_for_plot = (
-        signals["cfrc_body_normed"]
-        if normalize_mode != "none"
-        else signals["cfrc_body_raw"]
+    robot_contact_normal_max_n = normalize_time_series(
+        robot_contact_normal_max, mode=normalize_mode, eps=norm_eps
     )
-    cfrc_topk = cfrc_for_plot[:, topk_local]
+    robot_contact_count_n = normalize_time_series(
+        robot_contact_count, mode=normalize_mode, eps=norm_eps
+    )
 
-    fig, axs = plt.subplots(2, 2, figsize=(14, 8), dpi=100)
-    ax_cam, ax_q, ax_c, ax_txt = axs[0, 0], axs[0, 1], axs[1, 0], axs[1, 1]
+    fig = plt.figure(figsize=(14, 10), dpi=100)
+    gs = fig.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 0.7])
+    ax_cam = fig.add_subplot(gs[0, 0])
+    ax_q = fig.add_subplot(gs[0, 1])
+    ax_cmag = fig.add_subplot(gs[1, 0])
+    ax_ccount = fig.add_subplot(gs[1, 1])
+    ax_txt = fig.add_subplot(gs[2, :])
 
     cam_artist = ax_cam.imshow(camera_frames[0])
     ax_cam.set_title(f"Camera: {camera_name}")
     ax_cam.axis("off")
 
-    if dashboard_mode == "full":
-        for j in range(qfrc_for_plot.shape[1]):
-            ax_q.plot(
-                x,
-                qfrc_for_plot[:, j],
-                linewidth=1.0,
-                label=f"dof{data['arm_dof_indices'][j]}",
-            )
-        q_cursor = ax_q.axvline(0, color="black", linestyle="--", linewidth=1.2)
-        q_title = "qfrc_constraint (selected arm DoFs)"
-        if normalize_mode != "none":
-            q_title += f" [{normalize_mode}]"
-        ax_q.set_title(q_title)
-        ax_q.set_xlabel("Frame")
-        ax_q.set_ylabel("Normalized [-1,1]" if normalize_mode != "none" else "Raw")
-        ax_q.grid(True, alpha=0.25)
-        ax_q.legend(loc="upper right", fontsize=7, ncol=2)
-
-        for j in range(cfrc_topk.shape[1]):
-            ax_c.plot(x, cfrc_topk[:, j], linewidth=1.0, label=topk_body_names[j])
-        c_cursor = ax_c.axvline(0, color="black", linestyle="--", linewidth=1.2)
-        c_title = "cfrc_ext translational norm (top-k robot bodies)"
-        if normalize_mode != "none":
-            c_title += f" [{normalize_mode}]"
-        ax_c.set_title(c_title)
-        ax_c.set_xlabel("Frame")
-        ax_c.set_ylabel("Normalized [0,1]" if normalize_mode != "none" else "Raw")
-        ax_c.grid(True, alpha=0.25)
-        ax_c.legend(loc="upper right", fontsize=6)
-    elif dashboard_mode == "magnitude":
+    ax_q.plot(
+        x,
+        qfrc_constraint_mag,
+        linewidth=1.8,
+        color="tab:blue",
+        label="|qfrc_constraint|_arm",
+    )
+    ax_q.plot(
+        x,
+        qfrc_actuator_mag,
+        linewidth=1.8,
+        color="tab:orange",
+        label="|qfrc_actuator|_arm",
+    )
+    if normalize_mode != "none":
         ax_q.plot(
             x,
-            signals["qfrc_mag_raw"],
-            linewidth=1.8,
-            color="tab:blue",
-            label="qfrc_arm_l2_raw",
+            qfrc_constraint_mag_n,
+            linewidth=1.2,
+            linestyle="--",
+            color="tab:cyan",
+            label=f"constraint_norm({normalize_mode})",
         )
-        if normalize_mode != "none":
-            ax_q.plot(
-                x,
-                signals["qfrc_mag_normed"],
-                linewidth=1.5,
-                linestyle="--",
-                color="tab:orange",
-                label=f"qfrc_arm_l2_norm({normalize_mode})",
-            )
-        q_cursor = ax_q.axvline(0, color="black", linestyle="--", linewidth=1.2)
-        ax_q.set_title("qfrc_constraint arm magnitude probe")
-        ax_q.set_xlabel("Frame")
-        ax_q.set_ylabel("Magnitude")
-        ax_q.grid(True, alpha=0.25)
-        ax_q.legend(loc="upper right", fontsize=8)
-
-        ax_c.plot(
+        ax_q.plot(
             x,
-            signals["cfrc_max_raw"],
-            linewidth=1.8,
-            color="tab:green",
-            label="cfrc_robot_max_raw",
-        )
-        ax_c.plot(
-            x,
-            signals["cfrc_mag_raw"],
-            linewidth=1.6,
+            qfrc_actuator_mag_n,
+            linewidth=1.2,
+            linestyle="--",
             color="tab:red",
-            label="cfrc_robot_l2_raw",
+            label=f"actuator_norm({normalize_mode})",
         )
-        if normalize_mode != "none":
-            ax_c.plot(
-                x,
-                signals["cfrc_max_normed"],
-                linewidth=1.3,
-                linestyle="--",
-                color="tab:olive",
-                label=f"cfrc_max_norm({normalize_mode})",
-            )
-            ax_c.plot(
-                x,
-                signals["cfrc_mag_normed"],
-                linewidth=1.2,
-                linestyle="--",
-                color="tab:pink",
-                label=f"cfrc_l2_norm({normalize_mode})",
-            )
-        c_cursor = ax_c.axvline(0, color="black", linestyle="--", linewidth=1.2)
-        ax_c.set_title("cfrc_ext robot-body max / magnitude probe")
-        ax_c.set_xlabel("Frame")
-        ax_c.set_ylabel("Magnitude")
-        ax_c.grid(True, alpha=0.25)
-        ax_c.legend(loc="upper right", fontsize=8)
-    else:
-        raise ValueError(f"Unknown dashboard mode: {dashboard_mode}")
+    q_cursor = ax_q.axvline(0, color="black", linestyle="--", linewidth=1.2)
+    ax_q.set_title("Arm force magnitudes")
+    ax_q.set_xlabel("Frame")
+    ax_q.set_ylabel("Magnitude")
+    ax_q.grid(True, alpha=0.25)
+    ax_q.legend(loc="upper right", fontsize=8)
+
+    ax_cmag.plot(
+        x,
+        robot_contact_normal_sum,
+        linewidth=1.8,
+        color="tab:green",
+        label="contact_normal_sum(robot-other)",
+    )
+    ax_cmag.plot(
+        x,
+        robot_contact_normal_max,
+        linewidth=1.8,
+        color="tab:purple",
+        label="contact_normal_max(robot-other)",
+    )
+    ax_cmag.plot(
+        x,
+        data["contact_robot_force_l2_sum"],
+        linewidth=1.6,
+        color="tab:red",
+        label="contact_force_l2_sum(robot-other)",
+    )
+    if normalize_mode != "none":
+        ax_cmag.plot(
+            x,
+            robot_contact_normal_sum_n,
+            linewidth=1.1,
+            linestyle="--",
+            color="tab:olive",
+            label=f"normal_sum_norm({normalize_mode})",
+        )
+        ax_cmag.plot(
+            x,
+            robot_contact_normal_max_n,
+            linewidth=1.1,
+            linestyle="--",
+            color="tab:pink",
+            label=f"normal_max_norm({normalize_mode})",
+        )
+    cmag_cursor = ax_cmag.axvline(0, color="black", linestyle="--", linewidth=1.2)
+    ax_cmag.set_title("Contact force magnitudes")
+    ax_cmag.set_xlabel("Frame")
+    ax_cmag.set_ylabel("Magnitude")
+    ax_cmag.grid(True, alpha=0.25)
+    ax_cmag.legend(loc="upper right", fontsize=7)
+
+    ax_ccount.plot(
+        x,
+        robot_contact_count,
+        linewidth=1.6,
+        color="tab:brown",
+        label="contact_count(robot-other)",
+    )
+    ax_ccount.plot(
+        x,
+        data["contact_total_count"].astype(np.float64),
+        linewidth=1.4,
+        color="tab:gray",
+        label="contact_count(total)",
+    )
+    if normalize_mode != "none":
+        ax_ccount.plot(
+            x,
+            robot_contact_count_n,
+            linewidth=1.1,
+            linestyle="--",
+            color="tab:orange",
+            label=f"count_norm({normalize_mode})",
+        )
+    ccount_cursor = ax_ccount.axvline(0, color="black", linestyle="--", linewidth=1.2)
+    ax_ccount.set_title("Contact counts")
+    ax_ccount.set_xlabel("Frame")
+    ax_ccount.set_ylabel("Count")
+    ax_ccount.grid(True, alpha=0.25)
+    ax_ccount.legend(loc="upper right", fontsize=7)
 
     ax_txt.axis("off")
     txt_artist = ax_txt.text(
@@ -472,7 +469,8 @@ def make_dashboard_video(
         for t in range(t_horizon):
             cam_artist.set_data(camera_frames[t])
             q_cursor.set_xdata([t, t])
-            c_cursor.set_xdata([t, t])
+            cmag_cursor.set_xdata([t, t])
+            ccount_cursor.set_xdata([t, t])
 
             div = divergence[t]
             is_valid = bool(np.isfinite(div) and (div <= div_thresh))
@@ -482,35 +480,23 @@ def make_dashboard_video(
             txt = "\n".join(
                 [
                     f"episode: {episode:06d}",
-                    f"replay_mode: action",
-                    f"dashboard_mode: {dashboard_mode}",
-                    f"norm_mode: {normalize_mode}",
+                    "replay_mode: action",
                     f"frame: {t}/{t_horizon - 1}",
                     f"time_sec: {t / float(fps):.3f}",
-                    f"ncon: {int(ncon[t])}",
                     f"div_l2: {div_text}",
                     f"valid(div<={div_thresh}): {valid_text}",
+                    f"norm_mode: {normalize_mode}",
                     "",
-                    f"arm_joints: {len(data['arm_joint_names'])}",
                     f"arm_dofs: {len(data['arm_dof_indices'])}",
-                    f"robot_bodies_total: {len(robot_body_ids)}",
-                    f"cfrc_topk: {k}",
+                    f"robot_geoms: {len(data['robot_geom_names'])}",
+                    f"contact_total: {int(data['contact_total_count'][t])}",
+                    f"contact_robot: {int(data['contact_robot_count'][t])}",
+                    f"contact_normal_sum: {float(data['contact_robot_normal_sum'][t]):.5f}",
+                    f"contact_normal_max: {float(data['contact_robot_normal_max'][t]):.5f}",
+                    f"|qfrc_constraint|_arm: {float(qfrc_constraint_mag[t]):.5f}",
+                    f"|qfrc_actuator|_arm: {float(qfrc_actuator_mag[t]):.5f}",
                 ]
             )
-            if dashboard_mode == "magnitude":
-                txt += (
-                    "\n\n"
-                    f"qfrc_mag_raw: {signals['qfrc_mag_raw'][t]:.5f}\n"
-                    f"cfrc_max_raw: {signals['cfrc_max_raw'][t]:.5f}\n"
-                    f"cfrc_mag_raw: {signals['cfrc_mag_raw'][t]:.5f}"
-                )
-                if normalize_mode != "none":
-                    txt += (
-                        "\n"
-                        f"qfrc_mag_norm: {signals['qfrc_mag_normed'][t]:.5f}\n"
-                        f"cfrc_max_norm: {signals['cfrc_max_normed'][t]:.5f}\n"
-                        f"cfrc_mag_norm: {signals['cfrc_mag_normed'][t]:.5f}"
-                    )
             txt_artist.set_text(txt)
 
             fig.canvas.draw()
@@ -519,28 +505,18 @@ def make_dashboard_video(
 
     plt.close(fig)
 
-    signal_metrics = {
-        "qfrc_constraint_arm_l2_raw": stats_1d(signals["qfrc_mag_raw"]),
-        "cfrc_ext_robot_max_raw": stats_1d(signals["cfrc_max_raw"]),
-        "cfrc_ext_robot_l2_raw": stats_1d(signals["cfrc_mag_raw"]),
-        "normalization": signals["normalization_meta"],
-    }
-    if normalize_mode != "none":
-        signal_metrics["qfrc_constraint_arm_l2_normed"] = stats_1d(
-            signals["qfrc_mag_normed"]
-        )
-        signal_metrics["cfrc_ext_robot_max_normed"] = stats_1d(
-            signals["cfrc_max_normed"]
-        )
-        signal_metrics["cfrc_ext_robot_l2_normed"] = stats_1d(
-            signals["cfrc_mag_normed"]
-        )
-
     return {
-        "topk_body_names": topk_body_names,
-        "topk_body_ids": topk_body_ids,
-        "topk_local_indices": topk_local.tolist(),
-        "signal_metrics": signal_metrics,
+        "force_metrics": {
+            "qfrc_constraint_arm_l2": stats_1d(qfrc_constraint_mag),
+            "qfrc_actuator_arm_l2": stats_1d(qfrc_actuator_mag),
+        },
+        "contact_metrics": {
+            "contact_total_count": stats_1d(data["contact_total_count"]),
+            "contact_robot_count": stats_1d(data["contact_robot_count"]),
+            "contact_robot_normal_sum": stats_1d(data["contact_robot_normal_sum"]),
+            "contact_robot_normal_max": stats_1d(data["contact_robot_normal_max"]),
+            "contact_robot_force_l2_sum": stats_1d(data["contact_robot_force_l2_sum"]),
+        },
     }
 
 
@@ -548,20 +524,18 @@ def write_summary(
     summary_path: Path,
     output_video: Path,
     data: dict,
-    topk_info: dict,
+    metrics: dict,
     episode: int,
     camera_name: str,
     fps: int,
     width: int,
     height: int,
     div_thresh: float,
-    dashboard_mode: str,
     normalize_mode: str,
     norm_eps: float,
 ):
     div = data["divergence"]
     finite_div = div[np.isfinite(div)]
-    ncon = data["ncon"]
 
     valid_mask = np.zeros((data["T"],), dtype=bool)
     valid_mask[np.isfinite(div)] = div[np.isfinite(div)] <= div_thresh
@@ -569,32 +543,23 @@ def write_summary(
     summary = {
         "episode": int(episode),
         "replay_mode": "action",
+        "probe": "contact_actuator",
         "output_video": str(output_video),
         "camera_name": camera_name,
         "fps": int(fps),
-        "dashboard_mode": dashboard_mode,
+        "camera_width": int(width),
+        "camera_height": int(height),
         "normalization": {
             "mode": normalize_mode,
             "eps": float(norm_eps),
             "causal": normalize_mode in ("none", "running_absmax"),
         },
-        "camera_width": int(width),
-        "camera_height": int(height),
         "T": int(data["T"]),
-        "nv": int(data["nv"]),
-        "nbody": int(data["nbody"]),
         "selected_arm_joint_names": data["arm_joint_names"],
         "selected_arm_dof_indices": data["arm_dof_indices"],
-        "selected_cfrc_topk_body_names": topk_info["topk_body_names"],
-        "selected_cfrc_topk_body_ids": topk_info["topk_body_ids"],
-        "dof_joint_ids": data["dof_joint_ids"],
-        "force_probe_metrics": topk_info.get("signal_metrics"),
-        "ncon_stats": {
-            "mean": float(np.mean(ncon)),
-            "std": float(np.std(ncon)),
-            "min": int(np.min(ncon)),
-            "max": int(np.max(ncon)),
-        },
+        "robot_geom_count": len(data["robot_geom_names"]),
+        "force_metrics": metrics["force_metrics"],
+        "contact_metrics": metrics["contact_metrics"],
         "divergence_l2_stats": {
             "count": int(finite_div.size),
             "mean": float(np.mean(finite_div)) if finite_div.size else None,
@@ -610,7 +575,7 @@ def write_summary(
 
 
 def default_output_paths(episode: int):
-    base = Path("artifacts") / f"force_dashboard_ep{episode:06d}"
+    base = Path("artifacts") / f"contact_actuator_probe_ep{episode:06d}"
     return base.with_suffix(".mp4"), Path(str(base) + "_summary.json")
 
 
@@ -624,7 +589,7 @@ def main():
         "--output-video",
         type=str,
         default=None,
-        help="Output MP4 path. Default: artifacts/force_dashboard_epXXXXXX.mp4",
+        help="Output MP4 path. Default: artifacts/contact_actuator_probe_epXXXXXX.mp4",
     )
     parser.add_argument(
         "--camera-name",
@@ -638,13 +603,7 @@ def main():
     parser.add_argument(
         "--include-gripper",
         action="store_true",
-        help="Include gripper joints in qfrc plot",
-    )
-    parser.add_argument(
-        "--topk-cfrc",
-        type=int,
-        default=8,
-        help="Top-k robot bodies by total cfrc norm",
+        help="Include gripper joints in arm signal",
     )
     parser.add_argument(
         "--div-thresh",
@@ -653,17 +612,7 @@ def main():
         help="Divergence threshold for validity display",
     )
     parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=None,
-        help="Optional replay truncation length",
-    )
-    parser.add_argument(
-        "--dashboard-mode",
-        type=str,
-        choices=["full", "magnitude"],
-        default="magnitude",
-        help="full = per-DoF / per-body traces; magnitude = compact probe view",
+        "--max-steps", type=int, default=None, help="Optional replay truncation length"
     )
     parser.add_argument(
         "--normalize-mode",
@@ -702,15 +651,13 @@ def main():
     finally:
         env.close()
 
-    topk_info = make_dashboard_video(
+    metrics = make_dashboard_video(
         output_video=output_video,
         data=data,
         episode=args.episode,
         fps=args.fps,
         camera_name=args.camera_name,
-        topk_cfrc=args.topk_cfrc,
         div_thresh=args.div_thresh,
-        dashboard_mode=args.dashboard_mode,
         normalize_mode=args.normalize_mode,
         norm_eps=args.norm_eps,
     )
@@ -719,14 +666,13 @@ def main():
         summary_path=summary_path,
         output_video=output_video,
         data=data,
-        topk_info=topk_info,
+        metrics=metrics,
         episode=args.episode,
         camera_name=args.camera_name,
         fps=args.fps,
         width=args.width,
         height=args.height,
         div_thresh=args.div_thresh,
-        dashboard_mode=args.dashboard_mode,
         normalize_mode=args.normalize_mode,
         norm_eps=args.norm_eps,
     )
