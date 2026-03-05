@@ -230,8 +230,8 @@ def build_pre_mask(con_mask: np.ndarray, precontact_frames: int) -> np.ndarray:
 
 def build_labels(con_mask: np.ndarray, pre_mask: np.ndarray) -> np.ndarray:
     labels = np.zeros((con_mask.shape[0],), dtype=np.int8)  # free
-    labels[(con_mask == 1) & (pre_mask == 0)] = 2  # contact
-    labels[pre_mask == 1] = 1  # precontact
+    labels[con_mask == 1] = 2  # contact
+    labels[(pre_mask == 1) & (con_mask == 0)] = 1  # precontact
     return labels
 
 
@@ -409,7 +409,12 @@ def main():
     parser.add_argument("--threshold-high", type=float, default=0.3)
     parser.add_argument("--threshold-low", type=float, default=0.1)
     parser.add_argument("--precontact-frames", type=int, default=30)
-    parser.add_argument("--camera-name", type=str, default="robot0_agentview_right")
+    parser.add_argument(
+        "--camera-name",
+        type=str,
+        default="robot0_eye_in_hand",
+        help="Ignored at runtime; script forces robot0_eye_in_hand",
+    )
     parser.add_argument(
         "--rollout-source",
         type=str,
@@ -428,6 +433,7 @@ def main():
         help="Default: artifacts/force_regions_rollout_trace_epXXXXXX.mp4",
     )
     args = parser.parse_args()
+    args.camera_name = "robot0_eye_in_hand"
 
     dataset_root = Path(args.dataset).resolve()
     print(f"[start] dataset={dataset_root}")

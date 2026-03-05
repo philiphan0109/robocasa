@@ -105,8 +105,8 @@ def build_pre_mask(con_mask: np.ndarray, precontact_frames: int) -> np.ndarray:
 
 def build_labels(con_mask: np.ndarray, pre_mask: np.ndarray) -> np.ndarray:
     labels = np.zeros((con_mask.shape[0],), dtype=np.int8)  # free
-    labels[(con_mask == 1) & (pre_mask == 0)] = 2  # contact
-    labels[pre_mask == 1] = 1  # precontact
+    labels[con_mask == 1] = 2  # contact
+    labels[(pre_mask == 1) & (con_mask == 0)] = 1  # precontact
     return labels
 
 
